@@ -1,7 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-chcp 65001 >nul 2>&1
-title Nexus Playerok Bot - ╨г╤Б╤В╨░╨╜╨╛╨▓╤Й╨╕╨║
+title Nexus Playerok Bot - Ustanovshik
 
 set "ROOT=%~dp0"
 set "VENV=%ROOT%venv"
@@ -11,13 +10,13 @@ set "PYTHON_CMD="
 echo.
 echo +======================================================================+
 echo ^|                      NEXUS PLAYEROK BOT                               ^|
-echo ^|                     ╨г╨б╨в╨Р╨Э╨Ю╨Т╨Ъ╨Р ╨Э╨Р WINDOWS                             ^|
+echo ^|                     УСТАНОВКА НА WINDOWS                             ^|
 echo +======================================================================+
 echo.
-echo [╨Ш╨╜╤Д╨╛╤А╨╝╨░╤Ж╨╕╤П] ╨н╤В╨╛╤В ╤Г╤Б╤В╨░╨╜╨╛╨▓╤Й╨╕╨║ ╨┐╨╛╨┤╨│╨╛╤В╨╛╨▓╨╕╤В ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ ╨╕ ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╕.
+echo [Информация] Этот установщик подготовит окружение и зависимости.
 echo.
 
-echo [╨и╨░╨│ 1/4] ╨Я╨╛╨╕╤Б╨║ Python 3.12...
+echo [Шаг 1/4] Поиск Python 3.12...
 
 py -3.12 --version >nul 2>&1
 if %ERRORLEVEL% equ 0 (
@@ -43,26 +42,26 @@ if not defined PYTHON_CMD (
 )
 
 if not defined PYTHON_CMD (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] Python 3.12 ╨╜╨╡ ╨╜╨░╨╣╨┤╨╡╨╜.
-    echo ╨г╤Б╤В╨░╨╜╨╛╨▓╨╕╤В╨╡ Python 3.12 ╨╕ ╨┐╨╛╨▓╤В╨╛╤А╨╕╤В╨╡ ╨╖╨░╨┐╤Г╤Б╨║.
-    echo ╨б╤Б╤Л╨╗╨║╨░: https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe
+    echo [Ошибка] Python 3.12 не найден.
+    echo Установите Python 3.12 и повторите запуск.
+    echo Ссылка: https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe
     echo.
     pause
     exit /b 1
 )
 
-echo [OK] ╨Э╨░╨╣╨┤╨╡╨╜ ╨╕╨╜╤В╨╡╤А╨┐╤А╨╡╤В╨░╤В╨╛╤А: !PYTHON_CMD!
+echo [OK] Найден интерпретатор: !PYTHON_CMD!
 echo.
 
-echo [╨и╨░╨│ 2/4] ╨б╨╛╨╖╨┤╨░╨╜╨╕╨╡ ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨│╨╛ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╤П...
+echo [Шаг 2/4] Создание виртуального окружения...
 if exist "%VENV%" (
-    echo [╨Ш╨╜╤Д╨╛╤А╨╝╨░╤Ж╨╕╤П] ╨Э╨░╨╣╨┤╨╡╨╜╨╛ ╤Б╤В╨░╤А╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡, ╤Г╨┤╨░╨╗╤П╤О...
+    echo [Информация] Найдено старое окружение, удаляю...
     rmdir /s /q "%VENV%" 2>nul
 )
 
 %PYTHON_CMD% -m venv "%VENV%"
 if %ERRORLEVEL% neq 0 (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╤Б╨╛╨╖╨┤╨░╤В╤М ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡.
+    echo [Ошибка] Не удалось создать виртуальное окружение.
     echo.
     pause
     exit /b 1
@@ -71,19 +70,19 @@ if %ERRORLEVEL% neq 0 (
 for /f "tokens=2" %%v in ('"%VENV%\Scripts\python.exe" --version 2^>^&1') do set "VENV_PY_VER=%%v"
 echo !VENV_PY_VER! | findstr /r "^3\.12" >nul
 if %ERRORLEVEL% neq 0 (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Ю╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ ╤Б╨╛╨╖╨┤╨░╨╜╨╛ ╨╜╨░ Python !VENV_PY_VER!, ╨░ ╤В╤А╨╡╨▒╤Г╨╡╤В╤Б╤П 3.12.x
+    echo [Ошибка] Окружение создано на Python !VENV_PY_VER!, а требуется 3.12.x
     rmdir /s /q "%VENV%" 2>nul
     echo.
     pause
     exit /b 1
 )
 
-echo [OK] ╨Т╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡ ╤Б╨╛╨╖╨┤╨░╨╜╨╛.
+echo [OK] Виртуальное окружение создано.
 echo.
 
-echo [╨и╨░╨│ 3/4] ╨г╤Б╤В╨░╨╜╨╛╨▓╨║╨░ ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╡╨╣...
+echo [Шаг 3/4] Установка зависимостей...
 if not exist "%REQ%" (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Э╨╡ ╨╜╨░╨╣╨┤╨╡╨╜ ╤Д╨░╨╣╨╗ ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╡╨╣:
+    echo [Ошибка] Не найден файл зависимостей:
     echo "%REQ%"
     echo.
     pause
@@ -92,7 +91,7 @@ if not exist "%REQ%" (
 
 call "%VENV%\Scripts\activate.bat"
 if %ERRORLEVEL% neq 0 (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╨░╨║╤В╨╕╨▓╨╕╤А╨╛╨▓╨░╤В╤М ╨▓╨╕╤А╤В╤Г╨░╨╗╤М╨╜╨╛╨╡ ╨╛╨║╤А╤Г╨╢╨╡╨╜╨╕╨╡.
+    echo [Ошибка] Не удалось активировать виртуальное окружение.
     echo.
     pause
     exit /b 1
@@ -100,7 +99,7 @@ if %ERRORLEVEL% neq 0 (
 
 "%VENV%\Scripts\python.exe" -m pip install --upgrade pip
 if %ERRORLEVEL% neq 0 (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╨╛╨▒╨╜╨╛╨▓╨╕╤В╤М pip.
+    echo [Ошибка] Не удалось обновить pip.
     call "%VENV%\Scripts\deactivate.bat" >nul 2>&1
     echo.
     pause
@@ -109,7 +108,7 @@ if %ERRORLEVEL% neq 0 (
 
 "%VENV%\Scripts\python.exe" -m pip install -U -r "%REQ%"
 if %ERRORLEVEL% neq 0 (
-    echo [╨Ю╤И╨╕╨▒╨║╨░] ╨Э╨╡ ╤Г╨┤╨░╨╗╨╛╤Б╤М ╤Г╤Б╤В╨░╨╜╨╛╨▓╨╕╤В╤М ╨╖╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╕ ╨╕╨╖ requirements.txt
+    echo [Ошибка] Не удалось установить зависимости из requirements.txt
     call "%VENV%\Scripts\deactivate.bat" >nul 2>&1
     echo.
     pause
@@ -118,17 +117,17 @@ if %ERRORLEVEL% neq 0 (
 
 call "%VENV%\Scripts\deactivate.bat" >nul 2>&1
 
-echo [OK] ╨Ч╨░╨▓╨╕╤Б╨╕╨╝╨╛╤Б╤В╨╕ ╤Г╤Б╤В╨░╨╜╨╛╨▓╨╗╨╡╨╜╤Л.
+echo [OK] Зависимости установлены.
 echo.
 
-echo [╨и╨░╨│ 4/4] ╨Ч╨░╨▓╨╡╤А╤И╨╡╨╜╨╕╨╡...
+echo [Шаг 4/4] Завершение...
 echo.
 echo +======================================================================+
-echo ^|                            ╨У╨Ю╨в╨Ю╨Т╨Ю                                    ^|
+echo ^|                            ГОТОВО                                    ^|
 echo +======================================================================+
 echo.
-echo ╨С╨╛╤В ╨┐╨╛╨┤╨│╨╛╤В╨╛╨▓╨╗╨╡╨╜ ╨║ ╨╖╨░╨┐╤Г╤Б╨║╤Г.
-echo ╨Ч╨░╨┐╤Г╤Б╤В╨╕╤В╨╡ ╤Д╨░╨╣╨╗ Start.bat
+echo Бот подготовлен к запуску.
+echo Запустите файл Start.bat
 echo.
 pause
 exit /b 0
