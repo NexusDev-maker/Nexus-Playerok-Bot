@@ -1,0 +1,45 @@
+from aiogram import Router
+from .navigation import router as navigation_router
+from .actions_switch import router as actions_switch_router
+from .user_management import router as user_management_router
+from .pagination import router as pagination_router
+from .actions_enter import router as actions_enter_router
+from .actions_other import router as actions_other_router
+from .page import router as page_router
+from .quick_replies import router as quick_replies_router
+from .chat_history import router as chat_history_router
+from .proxy_management import router as proxy_management_router
+from .error_stats import router as error_stats_router
+from .config_backup import router as config_backup_router
+from .deals import router as deals_router
+from .items import router as items_router
+from .chats import router as chats_router
+from .plugin_management import router as plugin_management_router
+from .finance import router as finance_router
+from .withdrawal import router as withdrawal_router
+from .reviews import router as reviews_router
+from .data_replacement import router as data_replacement_router
+
+router = Router()
+router.include_routers(
+    page_router,
+    navigation_router,
+    actions_switch_router,
+    user_management_router,
+    pagination_router,
+    actions_enter_router,
+    actions_other_router,
+    quick_replies_router,
+    chat_history_router,
+    proxy_management_router,
+    error_stats_router,
+    config_backup_router,
+    plugin_management_router,
+    deals_router,
+    items_router,
+    chats_router,
+    finance_router,
+    withdrawal_router,
+    reviews_router,
+    data_replacement_router,
+)

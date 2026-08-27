@@ -1,0 +1,775 @@
+import datetime
+import sys
+import os
+import subprocess
+import shlex
+def _early_install_requirements():
+    """Устанавливает зависимости ДО импорта внешних модулей."""
+    requirements_path = "requirements.txt"
+    if not os.path.exists(requirements_path):
+        return
+
+    try:
+        import pkg_resources
+    except ImportError:
+        # setuptools не установлен - устанавливаем все
+        print("[*] Установка зависимостей...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-r", requirements_path, "-q"],
+            stdout=subprocess.DEVNULL if os.name != 'nt' else None
+        )
+        return
+
+    # Проверяем каждый пакет
+    missing = []
+    pip_options = []
+    with open(requirements_path, "r", encoding="utf-8") as f:
+        for line in f:
+            pkg = line.strip()
+            if not pkg or pkg.startswith("#"):
+                continue
+            if pkg.startswith("-"):
+                pip_options.extend(shlex.split(pkg))
+                continue
+            try:
+                pkg_resources.require(pkg)
+            except (pkg_resources.DistributionNotFound, pkg_resources.VersionConflict):
+                missing.append(pkg)
+
+    if missing:
+        print(f"[*] Установка недостающих пакетов: {', '.join(missing)}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *pip_options, *missing, "-q"])
+        # Перезагружаем pkg_resources после установки
+        import importlib
+        importlib.reload(pkg_resources)
+
+# _early_install_requirements()
+
+
+# Принудительная UTF-8 кодировка на Windows
+if sys.platform == 'win32':
+    os.system('chcp 65001 >nul 2>&1')
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+
+# ТОЧНАЯ версия Python для совместимости с плагинами
+REQUIRED_PYTHON_MAJOR = 3
+REQUIRED_PYTHON_MINOR = 12
+
+current_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+required_version = f"{REQUIRED_PYTHON_MAJOR}.{REQUIRED_PYTHON_MINOR}"
+
+if sys.version_info.major != REQUIRED_PYTHON_MAJOR or sys.version_info.minor != REQUIRED_PYTHON_MINOR:
+    print("\n" + "=" * 60)
+    print("ОШИБКА: НЕСОВМЕСТИМАЯ ВЕРСИЯ PYTHON!")
+    print("=" * 60)
+    print(f"\n   Текущая версия:   Python {current_version}")
+    print(f"   Требуемая версия: Python {required_version}.x")
+    print(f"\n   Скомпилированные плагины (.pyd) работают ТОЛЬКО")
+    print(f"   на той версии Python, на которой были собраны.")
+    print(f"\n   Скачать Python {required_version}:")
+    print(f"   https://www.python.org/downloads/release/python-3120/")
+    print("\n" + "=" * 60)
+    sys.exit(1)
+
+print(f"[OK] Python {current_version} - версия совместима")
+
+# Создаём директории до остальных операций, чтобы не ловить PermissionError
+import paths
+paths.ensure_dirs()
+
+import json
+import string as str_module
+
+def validate_activation_code(code: str) -> bool:
+    """Проверяет код активации по паттерну"""
+    if not code or len(code) != 8:
+        return False
+    code = code.upper()
+    if code[1] not in ['R', 'B']:
+        return False
+    if code[7] not in ['7', '4']:
+        return False
+    for c in code:
+        if c not in str_module.ascii_uppercase + str_module.digits:
+            return False
+    return True
+
+
+def check_activation_code():
+    """Активация отключена — бот запускается без кода."""
+    return True
+
+
+# Проверяем код при запуске
+check_activation_code()
+
+
+import asyncio
+import re
+import string
+import requests
+import traceback
+import base64
+import time
+from colorama import Fore, init as init_colorama
+from logging import getLogger
+
+from playerokapi.account import Account
+from playerokapi.exceptions import CloudflareDetectedException
+
+from __init__ import ACCENT_COLOR, VERSION, SECONDARY_COLOR, HIGHLIGHT_COLOR, SUCCESS_COLOR, BOT_NAME, DEVELOPER
+from settings import Settings as sett
+from core.utils import (
+    set_title,
+    setup_logger,
+    patch_requests,
+    init_main_loop,
+    run_async_in_thread
+)
+from core.plugins import (
+    load_plugins,
+    set_plugins,
+    connect_plugins
+)
+from core.handlers import call_bot_event
+from core.proxy_utils import normalize_proxy, validate_proxy
+from tgbot.cookie_guide import COOKIE_COLLECTION_GUIDE_TEXT, COOKIE_SUPPORTED_INPUTS_TEXT
+from updater import check_for_updates
+
+
+logger = getLogger("seal")
+
+main_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(main_loop)
+
+init_colorama()
+init_main_loop(main_loop)
+
+async def start_telegram_bot():
+    from tgbot.telegrambot import TelegramBot
+    run_async_in_thread(TelegramBot().run_bot)
+
+
+async def start_playerok_bot():
+    from plbot.playerokbot import PlayerokBot
+    await PlayerokBot().run_bot()
+
+
+def check_permissions():
+    """Проверяет права доступа к файлам настроек и исправляет их при необходимости."""
+    import stat
+    try:
+        import pwd
+    except Exception as e:
+        logger.info('Запуск на Windows, не проверяем права доступа')
+        return True
+    from pathlib import Path
+    from colorama import Fore
+
+    settings_dir = Path("bot_settings").resolve()
+    try:
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except:
+        return True
+
+    if not settings_dir.exists():
+        settings_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"{Fore.GREEN}[OK] Создана директория настроек: {settings_dir}{Fore.RESET}")
+
+    if not os.access(settings_dir, os.W_OK):
+        print(f"{Fore.RED}❌ Нет прав на запись в {settings_dir}{Fore.RESET}")
+        print(f"{Fore.YELLOW}Выполните: sudo chown -R {current_user}:{current_user} {settings_dir}{Fore.RESET}")
+        return False
+
+    fixed_files = []
+    problem_files = []
+
+    for json_file in settings_dir.glob("*.json"):
+        if not os.access(json_file, os.W_OK):
+            file_stat = os.stat(json_file)
+            current_uid = os.getuid()
+
+            if file_stat.st_uid != current_uid:
+                problem_files.append((json_file, f"Владелец: uid={file_stat.st_uid}, текущий пользователь: uid={current_uid}"))
+            else:
+                try:
+                    os.chmod(json_file, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IROTH)
+                    fixed_files.append(json_file.name)
+                except Exception as e:
+                    problem_files.append((json_file, str(e)))
+
+    if fixed_files:
+        print(f"{Fore.GREEN}✅ Исправлены права для файлов: {', '.join(fixed_files)}{Fore.RESET}")
+
+    if problem_files:
+        print(f"\n{Fore.RED}❌ Не удалось исправить права для файлов:{Fore.RESET}")
+        for file_path, error in problem_files:
+            print(f"{Fore.RED}   - {file_path.name}: {error}{Fore.RESET}")
+        print(f"\n{Fore.YELLOW}Файлы принадлежат другому пользователю (возможно root).{Fore.RESET}")
+        print(f"{Fore.YELLOW}Выполните команду для исправления:{Fore.RESET}")
+        for file_path, _ in problem_files:
+            print(f"{Fore.CYAN}   sudo chown {current_user}:{current_user} {file_path}{Fore.RESET}")
+        print()
+        return False
+
+    return True
+
+def check_and_configure_config():
+    import sys
+    config = sett.get("config")
+
+    # Проверяем, нужна ли интерактивная настройка
+    needs_config = (
+        not config["telegram"]["api"]["token"] or
+        not config["telegram"]["bot"]["password"]
+    )
+
+    # Если нет TTY (запуск через systemd) и конфиг не настроен - выходим с ошибкой
+    if needs_config and not sys.stdin.isatty():
+        print("")
+        print("=" * 60)
+        print("    ТРЕБУЕТСЯ РУЧНАЯ НАСТРОЙКА")
+        print("=" * 60)
+        print("")
+        print("  Бот запущен в фоновом режиме, но конфигурация")
+        print("  не завершена. Интерактивный ввод невозможен.")
+        print("")
+        print("  Отсутствуют:")
+        if not config["telegram"]["api"]["token"]:
+            print("    - Токен Telegram бота")
+        if not config["telegram"]["bot"]["password"]:
+            print("    - Пароль для Telegram бота")
+        print("")
+        print("=" * 60)
+        sys.exit(1)
+
+    def is_token_valid(token: str) -> bool:
+        if not re.match(r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$", token):
+            return False
+        try:
+            header, payload, signature = token.split('.')
+            for part in (header, payload, signature):
+                padding = '=' * (-len(part) % 4)
+                base64.urlsafe_b64decode(part + padding)
+            return True
+        except Exception:
+            return False
+
+    def is_pl_account_working() -> bool:
+        try:
+            Account(
+                token=config["playerok"]["api"]["token"],
+                cookies=config["playerok"]["api"].get("cookies", ""),
+                user_agent=config["playerok"]["api"]["user_agent"],
+                requests_timeout=config["playerok"]["api"]["requests_timeout"],
+                proxy=config["playerok"]["api"]["proxy"] or None
+            ).get()
+            return True
+        except:
+            return False
+
+    def is_pl_account_banned() -> bool:
+        try:
+            acc = Account(
+                token=config["playerok"]["api"]["token"],
+                cookies=config["playerok"]["api"].get("cookies", ""),
+                user_agent=config["playerok"]["api"]["user_agent"],
+                requests_timeout=config["playerok"]["api"]["requests_timeout"],
+                proxy=config["playerok"]["api"]["proxy"] or None
+            ).get()
+            return acc.profile.is_blocked
+        except:
+            return False
+
+    def is_user_agent_valid(ua: str) -> bool:
+        if not ua or not (10 <= len(ua) <= 512):
+            return False
+        allowed_chars = string.ascii_letters + string.digits + string.punctuation + ' '
+        return all(c in allowed_chars for c in ua)
+
+    # Используем глобальную функцию normalize_proxy из core.proxy_utils
+    # вместо локальной для единообразия
+
+    def is_proxy_valid(proxy: str) -> bool:
+        """Проверяет валидность прокси через глобальную функцию validate_proxy"""
+        try:
+            validate_proxy(proxy)
+            return True
+        except (ValueError, Exception):
+            return False
+
+    def is_proxy_working(proxy: str, timeout: int = 10, max_retries: int = 3) -> bool:
+        """Проверка прокси через playerok.com. Принимает УЖЕ нормализованный прокси!
+        Делает до max_retries попыток. Если хотя бы одна успешна - сразу возвращает True."""
+        # Для SOCKS5/SOCKS4 сохраняем протокол, для остальных добавляем http://
+        if proxy.startswith(('socks5://', 'socks4://')):
+            proxy_string = proxy
+        else:
+            proxy_string = f"http://{proxy}"
+
+
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"{Fore.CYAN}Проверка прокси (макс. {max_retries} попыток):")
+        print(f"{Fore.WHITE}  Исходный формат: {Fore.LIGHTWHITE_EX}{proxy}")
+        print(f"{Fore.WHITE}  Финальный формат: {Fore.LIGHTWHITE_EX}{proxy_string}")
+        print(f"{Fore.WHITE}  URL для теста: {Fore.LIGHTWHITE_EX}https://playerok.com")
+        print(f"{Fore.WHITE}  Timeout: {Fore.LIGHTWHITE_EX}{timeout} сек")
+        print(f"{Fore.CYAN}{'='*60}")
+
+        proxies = {
+            "http": proxy_string,
+            "https": proxy_string,
+        }
+        test_url = "https://playerok.com"
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                print(f"{Fore.CYAN}  Попытка {attempt}/{max_retries}...", end=" ")
+                response = requests.get(test_url, proxies=proxies, timeout=timeout)
+                if response.status_code in [200, 403]:
+                    print(f"{Fore.GREEN}✓ Успешно (код {response.status_code})")
+                    print(f"{Fore.CYAN}{'='*60}")
+                    print(f"{Fore.GREEN}✓ Прокси работает!")
+                    print(f"{Fore.CYAN}{'='*60}")
+                    return True
+                else:
+                    print(f"{Fore.YELLOW}⚠ Код {response.status_code}")
+            except ImportError:
+                print(f"{Fore.YELLOW}✗ Ошибка ImportError")
+                print(f"{Fore.YELLOW}⚠ Для работы SOCKS прокси нужен пакет PySocks")
+                print(f"{Fore.WHITE}  Установите его: {Fore.LIGHTWHITE_EX}pip install PySocks")
+                print(f"{Fore.CYAN}{'='*60}")
+                return False
+            except Exception as e:
+                error_msg = str(e)
+                print(f"{Fore.YELLOW}✗ Ошибка: {error_msg[:50]}...")
+
+                # Различаем типы ошибок для более информативных сообщений
+                if attempt == max_retries:  # Показываем детали только на последней попытке
+                    if "SOCKS" in error_msg:
+                        print(f"{Fore.WHITE}  Возможные причины:")
+                        print(f"    · Прокси-сервер не отвечает")
+                        print(f"    · Неверные учетные данные (логин/пароль)")
+                        print(f"    · Прокси-сервер заблокирован или не работает")
+                    elif "timeout" in error_msg.lower():
+                        print(f"{Fore.WHITE}  Прокси не ответил вовремя (таймаут)")
+                    elif "Connection" in error_msg:
+                        print(f"{Fore.WHITE}  Не удалось подключиться к прокси-серверу")
+
+        # Если ни одна попытка не удалась
+        print(f"{Fore.CYAN}{'='*60}")
+        print(f"{Fore.YELLOW}⚠ Прокси не работает (все {max_retries} попыток неудачны)")
+        print(f"{Fore.CYAN}  Примечание: Бот попытается использовать прокси при запуске.")
+        print(f"{Fore.CYAN}{'='*60}")
+
+        return False
+
+    def get_tg_proxy_for_session() -> str | None:
+        """
+        Возвращает прокси для Telegram в формате, который понимает aiogram/aiohttp.
+        Если формат в конфиге некорректный, возвращает None (бот продолжит запуск без прокси).
+        """
+        tg_proxy_raw = (config["telegram"]["api"].get("proxy") or "").strip()
+        if not tg_proxy_raw:
+            return None
+
+        try:
+            validate_proxy(tg_proxy_raw)
+            normalized_proxy = normalize_proxy(tg_proxy_raw)
+
+            if normalized_proxy != tg_proxy_raw:
+                config["telegram"]["api"]["proxy"] = normalized_proxy
+                sett.set("config", config)
+
+            if normalized_proxy.startswith(("socks5://", "socks4://", "http://", "https://")):
+                return normalized_proxy
+
+            # По умолчанию для TG-прокси без схемы используем HTTP.
+            return f"http://{normalized_proxy}"
+        except Exception as e:
+            logger.warning(
+                f"{Fore.YELLOW}Некорректный TG-прокси в bot_settings/config.json "
+                f"(telegram.api.proxy): {e}. Telegram-проверка токена продолжится без прокси."
+            )
+            return None
+
+    def is_tg_token_valid(token: str) -> bool:
+        pattern = r'^\d{7,12}:[A-Za-z0-9_-]{35}$'
+        return bool(re.match(pattern, token))
+
+    async def _fetch_tg_bot_data(
+            token: str,
+            request_timeout: int,
+            tg_proxy: str | None = None
+    ) -> tuple[bool, str | None, str | None, int | None]:
+        """Проверяет токен Telegram через aiogram. Возвращает (ok, username, reason, retry_after)."""
+        from aiogram import Bot
+        from aiogram.exceptions import (
+            TelegramAPIError,
+            TelegramBadRequest,
+            TelegramNetworkError,
+            TelegramNotFound,
+            TelegramRetryAfter,
+            TelegramServerError,
+            TelegramUnauthorizedError,
+        )
+
+        bot = None
+        try:
+            if tg_proxy:
+                from aiogram.client.session.aiohttp import AiohttpSession
+                bot = Bot(token=token, session=AiohttpSession(proxy=tg_proxy))
+            else:
+                bot = Bot(token=token)
+
+            me = await bot.get_me(request_timeout=request_timeout)
+            if me and me.is_bot:
+                return True, me.username or "", None, None
+            return False, None, "api_error", None
+        except (TelegramUnauthorizedError, TelegramBadRequest, TelegramNotFound):
+            return False, None, "invalid_token", None
+        except TelegramRetryAfter as exc:
+            retry_after = min(int(getattr(exc, "retry_after", 1)), 5)
+            return False, None, "rate_limit", retry_after
+        except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError, TimeoutError):
+            return False, None, "network", None
+        except TelegramAPIError:
+            return False, None, "api_error", None
+        except RuntimeError as exc:
+            if "aiohttp-socks" in str(exc).lower():
+                return False, None, "proxy_dependency_missing", None
+            return False, None, "api_error", None
+        except Exception:
+            return False, None, "api_error", None
+        finally:
+            if bot is not None:
+                await bot.session.close()
+
+    def is_tg_bot_exists() -> tuple[bool, str | None, str | None]:
+        """Проверяет Telegram бота. Возвращает (успех, username, reason)."""
+        max_attempts = 3
+        request_timeout = 20
+        backoff = (1, 2)
+        last_reason = "api_error"
+        max_wait_time = max_attempts * request_timeout + sum(backoff)
+        tg_proxy_for_session = get_tg_proxy_for_session()
+
+        print(f"\n{Fore.CYAN}Проверяю токен Telegram: начинаю подключение к API, подождите...")
+        if tg_proxy_for_session:
+            print(f"{Fore.CYAN}Для проверки токена используется TG-прокси из bot_settings/config.json.")
+        print(
+            f"{Fore.CYAN}Это может занять до {max_wait_time} сек при нестабильной сети."
+            f" Если ответ долго не приходит, будет автоматический повтор."
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            print(
+                f"{Fore.WHITE}  Попытка {attempt}/{max_attempts}: проверка токена...",
+                end=" ",
+                flush=True
+            )
+            ok, username, reason, retry_after = asyncio.run(
+                _fetch_tg_bot_data(
+                    token=config["telegram"]["api"]["token"],
+                    request_timeout=request_timeout,
+                    tg_proxy=tg_proxy_for_session
+                )
+            )
+            if ok:
+                print(f"{Fore.GREEN}OK")
+                return True, username, None
+
+            last_reason = reason or "api_error"
+            if last_reason == "invalid_token":
+                print(f"{Fore.LIGHTRED_EX}неверный токен")
+                return False, None, "invalid_token"
+
+            print(f"{Fore.YELLOW}ошибка")
+            if attempt < max_attempts:
+                if last_reason == "rate_limit":
+                    delay = retry_after if retry_after is not None else 1
+                    print(
+                        f"{Fore.YELLOW}! Telegram временно ограничил запросы."
+                        f" Повтор через {delay} сек..."
+                    )
+                elif last_reason == "network":
+                    delay = backoff[min(attempt - 1, len(backoff) - 1)]
+                    print(
+                        f"{Fore.YELLOW}! Сетевая ошибка при проверке Telegram API."
+                        f" Повтор через {delay} сек..."
+                    )
+                else:
+                    delay = backoff[min(attempt - 1, len(backoff) - 1)]
+                    print(
+                        f"{Fore.YELLOW}! Временная ошибка Telegram API."
+                        f" Повтор через {delay} сек..."
+                    )
+                time.sleep(delay)
+
+        return False, None, last_reason
+
+    def is_password_valid(password: str) -> bool:
+        if len(password) < 6 or len(password) > 64:
+            return False
+        common_passwords = {
+            "123456", "1234567", "12345678", "123456789", "password", "qwerty",
+            "admin", "123123", "111111", "abc123", "letmein", "welcome",
+            "monkey", "login", "root", "pass", "test", "000000", "user",
+            "qwerty123", "iloveyou"
+        }
+        if password.lower() in common_passwords:
+            return False
+        return True
+
+    # Проверка Telegram бота только при первичном вводе токена
+    tg_token_is_new = not config["telegram"]["api"]["token"]
+    tg_proxy_is_empty = not (config["telegram"]["api"].get("proxy") or "").strip()
+
+    if tg_token_is_new and tg_proxy_is_empty:
+        while True:
+            print(f"\n{Fore.WHITE}Опционально: введите {Fore.CYAN}прокси для Telegram{Fore.WHITE}.")
+            print(f"  {Fore.WHITE}• Этот шаг можно пропустить и добавить прокси позже в:")
+            print(f"    {Fore.LIGHTWHITE_EX}bot_settings/config.json {Fore.WHITE}(поле {Fore.LIGHTWHITE_EX}telegram.api.proxy{Fore.WHITE})")
+            print(f"  {Fore.YELLOW}• В RU регионе Telegram может работать нестабильно без прокси.")
+            print(f"  {Fore.YELLOW}• Используйте прокси не RU региона.")
+            print(f"  {Fore.WHITE}• Где купить: {Fore.LIGHTWHITE_EX}https://proxyline.net?ref=556414 либо https://proxy6.net/?r=918550 (купон -1N7xOhP9Ed)")
+            print(f"\n{Fore.WHITE}Форматы: ip:port | user:pass@ip:port | socks5://user:pass@ip:port")
+            print(f"\n  {Fore.YELLOW}Если не хотите указывать TG-прокси сейчас - нажмите Enter.")
+            tg_proxy = input(f"\n  {Fore.WHITE}> {Fore.LIGHTWHITE_EX}").strip()
+            if not tg_proxy:
+                print(f"\n{Fore.WHITE}Этап TG-прокси пропущен. Можно добавить позже в config.")
+                break
+            if is_proxy_valid(tg_proxy):
+                normalized_tg_proxy = normalize_proxy(tg_proxy)
+                config["telegram"]["api"]["proxy"] = normalized_tg_proxy
+                sett.set("config", config)
+                print(f"\n{Fore.GREEN}TG-прокси сохранен в config.")
+                break
+            print(f"\n{Fore.LIGHTRED_EX}Некорректный формат TG-прокси. Попробуйте еще раз.")
+
+    while not config["telegram"]["api"]["token"]:
+        print(f"\n{Fore.WHITE}Введите {Fore.CYAN}токен вашего Telegram бота{Fore.WHITE}. Бота нужно создать у @BotFather."
+              f"\n  {Fore.WHITE}· Пример: 7257913369:AAG2KjLL3-zvvfSQFSVhaTb4w7tR2iXsJXM")
+        token = input(f"  {Fore.WHITE}> {Fore.LIGHTWHITE_EX}").strip()
+        if is_tg_token_valid(token):
+            # Проверяем бота сразу при вводе токена
+            config["telegram"]["api"]["token"] = token
+            tg_ok, tg_username, tg_error_reason = is_tg_bot_exists()
+            if tg_ok:
+                sett.set("config", config)
+                print(f"\n{Fore.GREEN}Telegram бот подключен: {Fore.LIGHTCYAN_EX}@{tg_username}")
+            else:
+                config["telegram"]["api"]["token"] = ""
+                if tg_error_reason == "invalid_token":
+                    print(
+                        f"\n{Fore.LIGHTRED_EX}Токен Telegram недействителен"
+                        f" или отозван. Проверьте токен и попробуйте снова."
+                    )
+                elif tg_error_reason == "network":
+                    print(
+                        f"\n{Fore.LIGHTRED_EX}Не удалось проверить токен из-за сетевой ошибки"
+                        f" (доступ к Telegram API нестабилен). Попробуйте снова позже."
+                    )
+                    print(
+                        f"{Fore.YELLOW}Если вы из RU региона, Telegram может не работать без прокси."
+                        f" Добавьте прокси не RU региона в {Fore.LIGHTWHITE_EX}bot_settings/config.json"
+                        f"{Fore.YELLOW} (поле {Fore.LIGHTWHITE_EX}telegram.api.proxy{Fore.YELLOW})."
+                        f" Где купить: {Fore.LIGHTWHITE_EX}https://proxyline.net?ref=556414 либо https://proxy6.net/?r=918550 (купон -1N7xOhP9Ed)"
+                    )
+                elif tg_error_reason == "rate_limit":
+                    print(
+                        f"\n{Fore.LIGHTRED_EX}Telegram временно ограничил проверку токена."
+                        f" Подождите немного и повторите ввод."
+                    )
+                elif tg_error_reason == "proxy_dependency_missing":
+                    print(
+                        f"\n{Fore.LIGHTRED_EX}Для запуска Telegram через прокси не хватает зависимости"
+                        f" {Fore.LIGHTWHITE_EX}aiohttp-socks{Fore.LIGHTRED_EX}."
+                    )
+                    print(
+                        f"{Fore.YELLOW}Переустановите зависимости и попробуйте снова."
+                    )
+                else:
+                    print(
+                        f"\n{Fore.LIGHTRED_EX}Не удалось проверить токен из-за ошибки Telegram API."
+                        f" Попробуйте снова."
+                    )
+        else:
+            print(f"\n{Fore.LIGHTRED_EX}Похоже, что вы ввели некорректный токен. Убедитесь, что он соответствует формату и попробуйте ещё раз.")
+
+    while not config["telegram"]["bot"]["password"]:
+        print(f"\n{Fore.WHITE}Придумайте и введите {Fore.YELLOW}пароль для вашего Telegram бота{Fore.WHITE}. Бот будет запрашивать этот пароль при каждой новой попытке взаимодействия чужого пользователя с вашим Telegram ботом."
+              f"\n  {Fore.WHITE}· Пароль должен быть сложным, длиной не менее 6 и не более 64 символов.")
+        password = input(f"  {Fore.WHITE}> {Fore.LIGHTWHITE_EX}").strip()
+        if is_password_valid(password):
+            config["telegram"]["bot"]["password"] = password
+            sett.set("config", config)
+            print(f"\n{Fore.GREEN}Пароль успешно сохранён в конфиг.")
+        else:
+            print(f"\n{Fore.LIGHTRED_EX}Ваш пароль не подходит. Убедитесь, что он соответствует формату и не является лёгким и попробуйте ещё раз.")
+
+    # if is_pl_account_banned():
+    #     print(f"{Fore.LIGHTRED_EX}\nВаш Playerok аккаунт забанен! Увы, я не могу запустить бота на заблокированном аккаунте...")
+    #     config["playerok"]["api"]["token"] = ""
+    #     config["playerok"]["api"]["user_agent"] = ""
+    #     config["playerok"]["api"]["proxy"] = ""
+    #     sett.set("config", config)
+    #     return check_and_configure_config()
+
+    # Telegram бот уже проверен при вводе токена, дополнительная проверка не нужна
+
+
+if __name__ == "__main__":
+    try:
+        logger.info('Проверяю зависимости...')
+        import core.utils as core_utils
+        core_utils.install_requirements('requirements.txt')
+        patch_requests()
+        setup_logger()
+        set_title(f"{BOT_NAME} v{VERSION}")
+        print(f"""
+{Fore.CYAN}   ┌──────────────────────────────────────────────────────────────────────────────
+{Fore.LIGHTCYAN_EX}   │  {BOT_NAME} {Fore.LIGHTMAGENTA_EX}v{VERSION}{Fore.LIGHTCYAN_EX}
+{Fore.LIGHTCYAN_EX}   │  {Fore.WHITE}Помощник для автоматизации Playerok.com{Fore.LIGHTCYAN_EX}
+{Fore.LIGHTCYAN_EX}   │  {Fore.LIGHTWHITE_EX}Связь:{Fore.WHITE} {DEVELOPER}{Fore.CYAN}
+{Fore.CYAN}   └──────────────────────────────────────────────────────────────────────────────{Fore.RESET}
+""")
+        logger.info('Проверяю обновления...')
+
+        check_for_updates()
+
+        from datetime import datetime as datetime_time
+        try:
+            local_time = datetime.datetime.now()
+            logger.info(f'Часовой пояс устройства: {local_time.astimezone().tzinfo}')
+            # logger.info(f'Смещение от UTC: {local_time.utcoffset().total_seconds() // 3600} часов')
+        except Exception as e:
+            logger.error(f'Ошибка при получении часового пояса устройства: {e}')
+
+        try:
+            if not check_permissions():
+                logger.warning(
+                    f"\n{Fore.RED}Не удалось запустить бот из-за проблем с правами доступа.{Fore.RESET}"
+                    f"{Fore.YELLOW}Исправьте права и запустите бот снова.{Fore.RESET}\n"
+                )
+
+                sys.exit(1)
+        except Exception as e:
+            logger.info('Пропустил проверку прав доступа записи...')
+
+        logger.info('Загружаю конфигурацию...')
+        check_and_configure_config()
+
+        # Загружаем плагины
+        plugins = load_plugins()
+        set_plugins(plugins)
+
+        # Вызываем INIT перед инициализацией
+        # print(f"{Fore.CYAN}Инициализация системы...{Fore.RESET}")
+        main_loop.run_until_complete(call_bot_event("INIT", []))
+
+        # Подключаем плагины
+        # print(f"{Fore.CYAN}Подключение плагинов...{Fore.RESET}")
+        main_loop.run_until_complete(connect_plugins(plugins))
+
+        # Запускаем Telegram бота
+        # print(f"\n{Fore.CYAN}Запуск Telegram бота...{Fore.RESET}")
+        main_loop.run_until_complete(start_telegram_bot())
+
+        # Запускаем PlayerOk бота
+        # print(f"{Fore.CYAN}Инициализация аккаунта PlayerOk...{Fore.RESET}")
+        try:
+            main_loop.run_until_complete(start_playerok_bot())
+        except Exception as e:
+            logger.error(f"{Fore.LIGHTRED_EX}Ошибка при запуске Playerok бота: {e}")
+            logger.warning(f"{Fore.YELLOW}Бот продолжит работу без Playerok функционала")
+
+        # Вызываем POST_INIT после полной инициализации
+        # print(f"{Fore.CYAN}Завершение инициализации...{Fore.RESET}")
+        # ВАЖНО: используем main_loop, а не asyncio.run(), чтобы tasks плагинов
+        # (process_queue, check_status) работали в том же event loop
+        main_loop.run_until_complete(call_bot_event("POST_INIT", []))
+
+        main_loop.run_forever()
+    except KeyboardInterrupt:
+        # Пользователь нажал Ctrl+C - нормальный выход
+        logger.info(f"{Fore.LIGHTCYAN_EX}Бот остановлен пользователем. До свидания!")
+        raise SystemExit(0)  # Нормальный выход (код 0)
+
+    except CloudflareDetectedException as e:
+        # Cloudflare заблокировал запросы
+        # НЕ сбрасываем конфиг, а отправляем уведомления и останавливаем бот
+        logger.error(f"{Fore.LIGHTRED_EX}❌ Cloudflare заблокировал запросы к API!")
+        logger.error(f"{Fore.YELLOW}Требуется смена токена, прокси или user-agent.")
+
+        # Отправляем уведомление в Telegram
+        try:
+            from tgbot.telegrambot import get_telegram_bot
+            tg_bot = get_telegram_bot()
+            config = sett.get("config")
+
+            if tg_bot and config["telegram"]["api"]["token"]:
+                notification_text = (
+                    "🚨 <b>CLOUDFLARE ЗАБЛОКИРОВАЛ ЗАПРОСЫ!</b>\n\n"
+                    "❌ Бот не может выполнять запросы к Playerok API.\n\n"
+                    f"{COOKIE_SUPPORTED_INPUTS_TEXT}\n\n"
+                    f"{COOKIE_COLLECTION_GUIDE_TEXT}\n\n"
+                    "После отправки cookies при необходимости смените прокси и User-Agent,\n"
+                    "затем перезапустите бота.\n\n"
+                    "⚠️ <b>Бот остановлен.</b> Настройки сохранены.\n"
+                    "Измените данные через этот бот и перезапустите."
+                )
+
+                signed_users = config["telegram"]["bot"].get("signed_users", [])
+                for user_id in signed_users:
+                    try:
+                        asyncio.run(tg_bot.bot.send_message(
+                            chat_id=user_id,
+                            text=notification_text,
+                            parse_mode="HTML"
+                        ))
+                        logger.info(f"📨 Уведомление Cloudflare отправлено пользователю {user_id}")
+                    except Exception as notify_err:
+                        logger.warning(f"Не удалось отправить уведомление {user_id}: {notify_err}")
+        except Exception as tg_err:
+            logger.warning(f"Не удалось отправить уведомления в Telegram: {tg_err}")
+
+        # Выводим инструкцию в консоль
+        print(f"\n{Fore.LIGHTRED_EX}{'='*60}")
+        print(f"{Fore.LIGHTRED_EX}❌ CLOUDFLARE ЗАБЛОКИРОВАЛ ЗАПРОСЫ!")
+        print(f"{Fore.LIGHTRED_EX}{'='*60}")
+        print(f"\n{Fore.YELLOW}Требуется смена данных для доступа к API:")
+        print(f"{Fore.WHITE}  {COOKIE_SUPPORTED_INPUTS_TEXT}")
+        print("")
+        for guide_line in COOKIE_COLLECTION_GUIDE_TEXT.splitlines():
+            print(f"{Fore.WHITE}  {guide_line}")
+        print("")
+        print(f"{Fore.WHITE}  После отправки cookies при необходимости смените прокси и User-Agent.")
+        print(f"{Fore.WHITE}  Перезапустите бота.")
+        print(f"\n{Fore.GREEN}✅ Настройки сохранены. Измените через TG и перезапустите.")
+        print(f"{Fore.LIGHTRED_EX}{'='*60}\n")
+
+        raise SystemExit(2)  # Выход с кодом 2 (требуется смена данных)
+
+    except Exception as e:
+        try:
+            logger.info(f"{Fore.YELLOW}Проверка обновлений...{Fore.RESET}")
+            check_for_updates()
+        except Exception as update_error:
+            logger.warning(
+                f"{Fore.LIGHTRED_EX}Проверка обновлений не удалась: {update_error}{Fore.RESET}"
+            )
+        traceback.print_exc()
+        print(
+            f"\n{Fore.LIGHTRED_EX}Ваш бот словил непредвиденную ошибку и был выключен."
+            f"\n\n{Fore.WHITE}Связь: {Fore.LIGHTWHITE_EX}{DEVELOPER}\n"
+        )
+        raise SystemExit(1)  # Выход с ошибкой (код 1)
+
+    # Если run_forever() остановился через shutdown() - нормальный выход
+    logger.info(f"{Fore.LIGHTCYAN_EX}Бот корректно завершил работу.")
+    raise SystemExit(0)  # Нормальный выход (код 0)
+

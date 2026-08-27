@@ -1,0 +1,10 @@
+{
+  "tag": "2026-08-24-1",
+  "text": "🚀 <b>Nexus Playerok Bot</b>\n\nВышло обновление! Введите /update чтобы обновиться.",
+  "photo": "",
+  "pin": false,
+  "buttons": [
+    { "text": "📢 Наш канал", "url": "https://t.me/NexusPlayerok" },
+    { "text": "👨‍💻 Связь", "url": "https://t.me/inboxper" }
+  ]
+}

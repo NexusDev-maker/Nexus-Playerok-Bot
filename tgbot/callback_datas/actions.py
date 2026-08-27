@@ -1,0 +1,144 @@
+from aiogram.filters.callback_data import CallbackData
+
+
+class RememberUsername(CallbackData, prefix="rech"):
+    name: str
+    do: str
+
+
+class RememberDealId(CallbackData, prefix="rede"):
+    de_id: str
+    do: str
+
+
+class DealView(CallbackData, prefix="dealv"):
+    de_id: str
+
+
+class DealViewFromDeals(CallbackData, prefix="dealvd"):
+    de_id: str
+
+
+class DealItemView(CallbackData, prefix="dealit"):
+    de_id: str
+
+
+class DealsAction(CallbackData, prefix="dact"):
+    action: str
+    value: str | None = None
+
+
+class ItemViewFromItems(CallbackData, prefix="itmv"):
+    it_id: str
+
+
+class ItemsAction(CallbackData, prefix="iact"):
+    action: str
+    value: str | None = None
+
+
+class ChatsAction(CallbackData, prefix="cact"):
+    action: str
+    value: str | None = None
+
+
+class DeleteIncludedRestoreItem(CallbackData, prefix="delinre"):
+    index: int
+
+
+class DeleteExcludedRestoreItem(CallbackData, prefix="delexre"):
+    index: int
+
+
+class AutoResponseToggle(CallbackData, prefix="artog"):
+    message_type: str  # greeting, confirmation_seller, confirmation_buyer, deal_has_problem, deal_problem_resolved, review
+
+
+class AutoResponseEdit(CallbackData, prefix="aredit"):
+    message_type: str  # greeting, confirmation_seller, confirmation_buyer, deal_has_problem, deal_problem_resolved, review
+
+
+class LogsAction(CallbackData, prefix="logact"):
+    action: str
+
+
+class ChatHistory(CallbackData, prefix="chath"):
+    chat_id: str
+
+
+class QuickReplySelect(CallbackData, prefix="qrsel"):
+    username: str
+    reply_name: str
+
+
+class QuickReplyAction(CallbackData, prefix="qract"):
+    action: str  # add, edit, delete, confirm_edit, confirm_delete, cancel_send
+    reply_name: str | None = None
+
+
+class ReviewMonitorToggle(CallbackData, prefix="rmtog"):
+    pass  # Просто переключение вкл/выкл
+
+
+class ReviewMonitorAction(CallbackData, prefix="rmact"):
+    action: str  # set_days
+
+
+class SetWatermark(CallbackData, prefix="setwm"):
+    value: str
+
+
+class WatermarkPreset(CallbackData, prefix="wmpre"):
+    index: int
+
+
+class GreetingCooldownEdit(CallbackData, prefix="grcool"):
+    pass  # Активирует режим ввода нового интервала
+
+
+class DeleteIncludedRaiseItem(CallbackData, prefix="delinra"):
+    index: int
+
+
+class DeleteExcludedRaiseItem(CallbackData, prefix="delexra"):
+    index: int
+
+
+class ErrorStatsDay(CallbackData, prefix="errday"):
+    day: str
+
+
+class DeleteIncludedAutoCompleteItem(CallbackData, prefix="delinac"):
+    index: int
+
+
+class DeleteExcludedAutoCompleteItem(CallbackData, prefix="delexac"):
+    index: int
+
+
+class FinanceAction(CallbackData, prefix="finact"):
+    action: str  # tx_next, tx_prev, tx_refresh
+    value: str | None = None
+
+
+class CardAction(CallbackData, prefix="cardact"):
+    action: str  # del, del_confirm
+    card_id: str
+
+
+class WithdrawAction(CallbackData, prefix="wdact"):
+    action: str  # provider, card, sbp_bank, confirm, cancel
+    value: str | None = None
+
+
+class ReviewsAction(CallbackData, prefix="revact"):
+    action: str  # next, prev, refresh
+
+
+class DataReplacementPage(CallbackData, prefix="drpage"):
+    index: int
+
+
+class DataReplacementAction(CallbackData, prefix="dract"):
+    action: str  # toggle, delete, del_confirm
+    index: int

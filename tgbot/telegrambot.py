@@ -1,0 +1,711 @@
+from __future__ import annotations
+import asyncio
+import textwrap
+import logging
+import random
+import threading
+from html import escape as html_escape
+from colorama import Fore
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramRetryAfter, TelegramNetworkError, TelegramForbiddenError, TelegramAPIError
+import re
+
+from __init__ import ACCENT_COLOR, VERSION, DEVELOPER, REPOSITORY, TELEGRAM_CHANNEL, TELEGRAM_CHAT, TELEGRAM_BOT, BOT_NAME
+from settings import Settings as sett
+from core.proxy_utils import normalize_proxy, validate_proxy
+from core.plugins import get_plugins
+from core.handlers import call_bot_event
+
+from . import router as main_router
+from . import templates as templ
+from .cookie_guide import build_cookie_collection_instruction
+
+
+logger = logging.getLogger("seal.telegram")
+
+TG_PROXY_HELP_TEXT = (
+    "Если вы из RU региона, Telegram может работать нестабильно без прокси. "
+    "Добавьте прокси не RU региона в bot_settings/config.json (telegram.api.proxy). "
+    "Купить: https://proxyline.net?ref=556414 либо https://proxy6.net/?r=918550 (купон -1N7xOhP9Ed)"
+)
+
+
+def _build_tg_proxy_url(raw_proxy: str | None) -> tuple[str | None, str | None]:
+    """
+    Возвращает прокси для aiogram и нормализованное значение для config.
+    """
+    proxy = (raw_proxy or "").strip()
+    if not proxy:
+        return None, None
+
+    validate_proxy(proxy)
+    normalized_proxy = normalize_proxy(proxy)
+
+    if normalized_proxy.startswith(("socks5://", "socks4://", "http://", "https://")):
+        return normalized_proxy, normalized_proxy
+
+    # По умолчанию для TG-прокси без схемы используем HTTP.
+    return f"http://{normalized_proxy}", normalized_proxy
+
+
+class TelegramFetchUpdatesHintHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord):
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+
+        if "Failed to fetch updates" in message and "TelegramNetworkError" in message:
+            logger.warning(
+                "Если Telegram работает нестабильно, добавьте прокси не RU региона "
+                "в bot_settings/config.json (telegram.api.proxy). "
+                "Купить: https://proxyline.net?ref=556414 либо https://proxy6.net/?r=918550 (купон -1N7xOhP9Ed)"
+            )
+
+
+def get_telegram_bot() -> TelegramBot | None:
+    if hasattr(TelegramBot, "instance"):
+        return getattr(TelegramBot, "instance")
+
+
+def get_telegram_bot_loop() -> asyncio.AbstractEventLoop | None:
+    if hasattr(get_telegram_bot(), "loop"):
+        return getattr(get_telegram_bot(), "loop")
+
+
+class TelegramBot:
+    def __new__(cls, *args, **kwargs) -> TelegramBot:
+        if not hasattr(cls, "instance"):
+            cls.instance = super(TelegramBot, cls).__new__(cls)
+        return getattr(cls, "instance")
+
+    def __init__(self):
+        logging.getLogger("aiogram").setLevel(logging.ERROR)
+        logging.getLogger("aiogram.event").setLevel(logging.ERROR)
+        dispatcher_logger = logging.getLogger("aiogram.dispatcher")
+        dispatcher_logger.setLevel(logging.ERROR)
+        if not any(isinstance(handler, TelegramFetchUpdatesHintHandler) for handler in dispatcher_logger.handlers):
+            dispatcher_logger.addHandler(TelegramFetchUpdatesHintHandler())
+
+        config = sett.get("config")
+        self.bot = self._build_bot_from_config(config)
+        self.dp = Dispatcher()
+
+        # Добавляем middleware для проверки авторизации и статуса плагинов
+        from .middleware import AuthMiddleware, PluginStateMiddleware, ErrorMiddleware, BrandLockMiddleware
+
+        # ErrorMiddleware должен быть первым, чтобы перехватывать все ошибки
+        self.dp.message.middleware(ErrorMiddleware())
+        self.dp.callback_query.middleware(ErrorMiddleware())
+
+        self.dp.message.middleware(BrandLockMiddleware())
+        self.dp.callback_query.middleware(BrandLockMiddleware())
+
+        self.dp.message.middleware(PluginStateMiddleware())
+        self.dp.callback_query.middleware(PluginStateMiddleware())
+        self.dp.message.middleware(AuthMiddleware())
+        self.dp.callback_query.middleware(AuthMiddleware())
+
+        for plugin in get_plugins():
+            try:
+                logger.info(
+                    f"Регистрация TG-роутеров плагина {plugin.meta.name}: {len(plugin.telegram_bot_routers)}"
+                )
+                for router in plugin.telegram_bot_routers:
+                    main_router.include_router(router)
+                # Помечаем, что роутеры уже зарегистрированы
+                plugin._routers_registered = True
+            except Exception as e:
+                logger.error(f"✗ Ошибка при регистрации роутеров плагина {plugin.meta.name}: {e}")
+                logger.info(f"Бот продолжит работу без роутеров плагина {plugin.meta.name}")
+        self.dp.include_router(main_router)
+        self._startup_status_message_ids: dict[int, int] = self._load_startup_status_message_ids()
+        self._startup_status_last_text: dict[int, str] = {}
+        self._startup_status_lock = asyncio.Lock()
+        self._playerok_startup_active: bool = False
+        self._playerok_startup_details: str = "Запускаюсь, проверяю Playerok…"
+        self._playerok_activation_prompt_sent: bool = False
+        self._recovery_dialog_lock = threading.Lock()
+        self._active_recovery_dialog_users: set[int] = set()
+
+    def _build_bot_from_config(self, config: dict | None = None) -> Bot:
+        config = config or sett.get("config")
+        token = config["telegram"]["api"]["token"]
+        raw_proxy = (config["telegram"]["api"].get("proxy") or "").strip()
+
+        if not raw_proxy:
+            return Bot(token=token)
+
+        try:
+            proxy_url, normalized_proxy = _build_tg_proxy_url(raw_proxy)
+
+            if normalized_proxy and normalized_proxy != raw_proxy:
+                config["telegram"]["api"]["proxy"] = normalized_proxy
+                sett.set("config", config)
+
+            logger.info("TG-прокси применен ко всем запросам Telegram API.")
+            return Bot(token=token, session=AiohttpSession(proxy=proxy_url))
+        except Exception as proxy_error:
+            logger.warning(
+                f"Некорректный TG-прокси в bot_settings/config.json (telegram.api.proxy): {proxy_error}. "
+                f"Telegram будет запущен без прокси."
+            )
+            logger.warning(TG_PROXY_HELP_TEXT)
+            return Bot(token=token)
+
+
+    async def _update_bot_commands(self):
+        """
+        Обновляет список команд бота, добавляя команды из плагинов.
+          
+        Метод собирает команды из всех загруженных плагинов, которые имеют команды,
+        и добавляет их в список команд бота. Это позволяет плагинам добавлять свои
+        команды в автодополнение Telegram.
+        
+        Обрабатывает ошибки для каждого плагина отдельно, чтобы сбой одного плагина
+        не влиял на работу остальных.
+        """
+        try:
+            config = sett.get("config")
+            # Стандартные команды бота
+            commands = [
+                BotCommand(command="start", description="🏠 Главное меню"),
+            ]
+            
+            # Команды администратора (добавляются только если пользователь авторизован)
+            commands.extend([
+                BotCommand(command="profile", description="🏠 Профиль Playerok"),
+                BotCommand(command="deals", description="🧾 Поиск сделок"),
+                BotCommand(command="items", description="📦 Товары аккаунта"),
+                BotCommand(command="chats", description="💬 Чаты аккаунта"),
+                BotCommand(command="restart", description="🔄 Перезагрузить бота"),
+                BotCommand(command="update", description="⬆️ Обновить бота"),
+                BotCommand(command="playerok_status", description="🔰 Проверить авторизацию в аккаунте"),
+                # BotCommand(command="power_off", description="⚡ Выключить бота"), #todo продумать логику при автозапуске, пока спряу
+                BotCommand(command="logs", description="📜 Показать логи"),
+                BotCommand(command="sys", description="🧪 Диагностика системы"),
+                BotCommand(command="watermark", description="©️ Водяной знак"),
+                BotCommand(command="fingerprint", description="🧑‍💻 Фингерпринт устройства"),
+                BotCommand(command="config_backup", description="💾 Backup конфига"),
+
+            ])
+            
+            def _normalize_command(raw: str) -> str | None:
+                cmd = (raw or "").strip()
+                if cmd.startswith("/"):
+                    cmd = cmd[1:]
+                cmd = cmd.strip().lower()
+                if not cmd:
+                    return None
+                if not re.fullmatch(r"[a-z0-9_]{1,32}", cmd):
+                    return None
+                return cmd
+            
+            # Добавляем команды из плагинов
+            for plugin in get_plugins():
+                if hasattr(plugin, 'bot_commands') and plugin.bot_commands:
+                    try:
+                        plugin_cmds = plugin.bot_commands
+                        if callable(plugin_cmds):
+                            plugin_cmds = plugin_cmds()
+                        if asyncio.iscoroutine(plugin_cmds):
+                            plugin_cmds = await plugin_cmds
+                        if not isinstance(plugin_cmds, (list, tuple)):
+                            raise TypeError(
+                                f"BOT_COMMANDS must be list/tuple, got {type(plugin_cmds).__name__}"
+                            )
+ 
+                        added = 0
+                        
+                        for cmd in plugin_cmds:
+                            # Конвертируем tuple/list в BotCommand
+                            if isinstance(cmd, (tuple, list)) and len(cmd) >= 2:
+                                normalized = _normalize_command(str(cmd[0]))
+                                if not normalized:
+                                    logger.warning(
+                                        f"Команда плагина {plugin.meta.name} пропущена (invalid): {cmd[0]!r}"
+                                    )
+                                    continue
+                                commands.append(BotCommand(
+                                    command=normalized,
+                                    description=cmd[1]
+                                ))
+                                added += 1
+                            elif isinstance(cmd, BotCommand):
+                                normalized = _normalize_command(cmd.command)
+                                if not normalized:
+                                    logger.warning(
+                                        f"Команда плагина {plugin.meta.name} пропущена (invalid): {cmd.command!r}"
+                                    )
+                                    continue
+                                commands.append(
+                                    BotCommand(command=normalized, description=cmd.description)
+                                )
+                                added += 1
+
+                        logger.info(
+                            f"Команды плагина {plugin.meta.name} добавлены: {added}"
+                        )
+                    except Exception as e:
+                        logger.error(f"Ошибка получения команд из плагина {plugin.meta.name}: {e}")
+            
+            # Устанавливаем обновленный список команд
+            if not any(getattr(cmd, "command", None) == "api_errors" for cmd in commands):
+                commands.append(BotCommand(command="api_errors", description="🚨 Ошибки API"))
+            await self.bot.set_my_commands(commands)
+            logger.info(f"set_my_commands: установлено команд = {len(commands)}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при обновлении команд бота: {e}")
+    
+    async def _set_main_menu(self):
+
+        await self._update_bot_commands()
+
+    async def _set_short_description(self):
+        """Устанавливает короткое описание бота (раздел Bio в Telegram)."""
+        try:
+            short_description = (
+                f"{BOT_NAME}\n"
+                f"Связь: {DEVELOPER}"
+            )
+            # Очищаем и заново выставляем short description для default/ru/en,
+            # чтобы убрать остатки старых значений в разных локалях Telegram-клиента.
+            for lang in (None, "ru", "en"):
+                clear_kwargs = {"short_description": ""}
+                set_kwargs = {"short_description": short_description}
+                if lang:
+                    clear_kwargs["language_code"] = lang
+                    set_kwargs["language_code"] = lang
+                await self.bot.set_my_short_description(**clear_kwargs)
+                await self.bot.set_my_short_description(**set_kwargs)
+        except Exception:
+            pass
+
+    async def _set_description(self):
+        """Устанавливает полное описание бота с короткими ссылками."""
+        try:
+            description = textwrap.dedent(f"""
+{BOT_NAME} v{VERSION}
+
+Бот-помощник для автоматизации работы с маркетплейсом Playerok.com
+
+✨ Возможности:
+• Вечный онлайн
+• Авто-восстановление товаров
+• Авто-выдача
+• Авто-ответ
+• Уведомления о сделках
+• Вызов продавца в чат
+• И многое другое
+
+🔗 Связь: {DEVELOPER}
+
+🦅 Powered by Nexus Playerok Bot • @NexusPlayerok
+            """).strip()
+            await self.bot.set_my_description(description=description)
+        except Exception:
+            pass
+
+    def _build_playerok_startup_status_text(self, active: bool, details: str | None = None) -> str:
+        base_details = str(details or "").strip()
+        if not base_details:
+            base_details = "Аккаунт активен и готов к работе." if active else "Жду активацию — отправь cookies, и оживлю аккаунт."
+        safe_details = html_escape(base_details)
+
+        playerok_line = (
+            "┗ ✅ <b>Playerok</b> — аккаунт активен"
+            if active else
+            "┗ ⏳ <b>Playerok</b> — жду активацию"
+        )
+        return (
+            f"<b>{BOT_NAME}</b> <code>v{VERSION}</code> на связи!\n\n"
+            "<b>Статус запуска:</b>\n"
+            "┣ ✅ <b>Telegram</b> — запущен\n"
+            f"{playerok_line}\n\n"
+            f"{safe_details}"
+        )
+
+    @staticmethod
+    def _load_startup_status_message_ids() -> dict[int, int]:
+        config = sett.get("config")
+        raw = config.get("telegram", {}).get("bot", {}).get("startup_status_message_ids", {})
+        if not isinstance(raw, dict):
+            return {}
+
+        parsed: dict[int, int] = {}
+        for raw_user_id, raw_message_id in raw.items():
+            try:
+                user_id = int(raw_user_id)
+                message_id = int(raw_message_id)
+            except Exception:
+                continue
+            if user_id <= 0 or message_id <= 0:
+                continue
+            parsed[user_id] = message_id
+        return parsed
+
+    @staticmethod
+    def _persist_startup_status_message_ids(ids: dict[int, int]) -> None:
+        config = sett.get("config")
+        telegram_bot_cfg = config.setdefault("telegram", {}).setdefault("bot", {})
+        telegram_bot_cfg["startup_status_message_ids"] = {str(uid): int(mid) for uid, mid in ids.items()}
+        sett.set("config", config)
+
+    @staticmethod
+    def _get_unique_signed_user_ids(config: dict | None) -> list[int]:
+        cfg = config or {}
+        raw_users = cfg.get("telegram", {}).get("bot", {}).get("signed_users", [])
+        if not isinstance(raw_users, list):
+            return []
+
+        unique_ids: list[int] = []
+        seen: set[int] = set()
+        for raw_user_id in raw_users:
+            try:
+                user_id = int(raw_user_id)
+            except Exception:
+                continue
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            unique_ids.append(user_id)
+        return unique_ids
+
+    async def _upsert_startup_status_message(self, user_id: int, text: str) -> None:
+        if not isinstance(user_id, int):
+            return
+
+        async with self._startup_status_lock:
+            prev_text = self._startup_status_last_text.get(user_id)
+            if prev_text == text:
+                return
+
+            # Правим только сообщение текущего запуска: id из конфига от прошлого запуска
+            # уехал вверх по истории — на него не редактируем, а шлём новое (видно внизу чата).
+            sent_this_run = user_id in self._startup_status_last_text
+            stored_message_id = self._startup_status_message_ids.get(user_id)
+            if sent_this_run and stored_message_id:
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=stored_message_id,
+                        text=text,
+                        parse_mode="HTML",
+                    )
+                    self._startup_status_last_text[user_id] = text
+                    return
+                except Exception:
+                    pass
+
+            sent_message = await self.bot.send_message(
+                chat_id=user_id,
+                text=text,
+                parse_mode="HTML",
+            )
+            self._startup_status_message_ids[user_id] = sent_message.message_id
+            self._startup_status_last_text[user_id] = text
+            try:
+                self._persist_startup_status_message_ids(self._startup_status_message_ids)
+            except Exception as e:
+                logger.debug(f"Не удалось сохранить startup_status_message_ids: {e}")
+
+    async def ensure_startup_status_for_user(self, user_id: int) -> None:
+        text = self._build_playerok_startup_status_text(
+            active=self._playerok_startup_active,
+            details=self._playerok_startup_details,
+        )
+        try:
+            await self._upsert_startup_status_message(user_id, text)
+        except Exception as e:
+            logger.debug(f"Не удалось отправить startup-статус user_id={user_id}: {e}")
+
+    def set_playerok_recovery_dialog_active(self, user_id: int | None = None, active: bool = True) -> None:
+        with self._recovery_dialog_lock:
+            if user_id is None:
+                if active:
+                    signed_users = sett.get("config").get("telegram", {}).get("bot", {}).get("signed_users", [])
+                    normalized_users: set[int] = set()
+                    if isinstance(signed_users, list):
+                        for raw_user_id in signed_users:
+                            try:
+                                normalized_users.add(int(raw_user_id))
+                            except Exception:
+                                continue
+                    self._active_recovery_dialog_users = normalized_users
+                else:
+                    self._active_recovery_dialog_users.clear()
+                return
+
+            try:
+                normalized_user_id = int(user_id)
+            except Exception:
+                return
+
+            if active:
+                self._active_recovery_dialog_users.add(normalized_user_id)
+            else:
+                self._active_recovery_dialog_users.discard(normalized_user_id)
+
+    def is_playerok_recovery_dialog_active(self) -> bool:
+        with self._recovery_dialog_lock:
+            return bool(self._active_recovery_dialog_users)
+
+    async def update_playerok_startup_status(self, active: bool, details: str | None = None) -> None:
+        self._playerok_startup_active = bool(active)
+        self._playerok_startup_details = str(details or "").strip()
+
+        config = sett.get("config")
+        signed_user_ids = self._get_unique_signed_user_ids(config)
+        if not signed_user_ids:
+            return
+
+        status_text = self._build_playerok_startup_status_text(
+            active=self._playerok_startup_active,
+            details=self._playerok_startup_details,
+        )
+        for user_id in signed_user_ids:
+            try:
+                await self._upsert_startup_status_message(user_id, status_text)
+            except Exception as e:
+                logger.debug(f"Не удалось обновить startup-статус user_id={user_id}: {e}")
+
+    @staticmethod
+    def _is_playerok_onboarding_required(config: dict | None) -> bool:
+        cfg = config or {}
+        api_cfg = cfg.get("playerok", {}).get("api", {})
+        cookies = str(api_cfg.get("cookies") or "").strip()
+        user_agent = str(api_cfg.get("user_agent") or "").strip()
+        return not cookies or not user_agent
+
+    async def _ensure_startup_status_and_playerok_prompt(self) -> None:
+        config = sett.get("config")
+        signed_user_ids = self._get_unique_signed_user_ids(config)
+        if not signed_user_ids:
+            return
+
+        await self.update_playerok_startup_status(
+            active=self._playerok_startup_active,
+            details=self._playerok_startup_details,
+        )
+
+        if not self._is_playerok_onboarding_required(config):
+            self._playerok_activation_prompt_sent = False
+            return
+
+        if self._playerok_activation_prompt_sent:
+            return
+
+        if self.is_playerok_recovery_dialog_active():
+            return
+
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📥 Отправить cookies", callback_data="playerok_recovery_open")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="playerok_recovery_cancel")],
+            ]
+        )
+        text = (
+            build_cookie_collection_instruction(
+                "⚠️ <b>Playerok пока не активирован</b>\n\n"
+                "Не хватает cookies и/или User-Agent для запуска аккаунта.\n"
+                "Нажмите кнопку ниже и отправьте cookies."
+            )
+        )
+
+        sent_any = False
+        for user_id in signed_user_ids:
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text=text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
+                sent_any = True
+            except Exception as e:
+                logger.debug(f"Не удалось отправить prompt активации Playerok user_id={user_id}: {e}")
+
+        if sent_any:
+            self._playerok_activation_prompt_sent = True
+
+
+    async def run_bot(self):
+        # Миграция старого прокси в новую систему (выполняется один раз)
+        from core.proxy_migration import migrate_old_proxy_to_new_system
+        migrate_old_proxy_to_new_system()
+        
+        self.loop = asyncio.get_running_loop()
+        max_retries = 5  # Максимальное количество попыток подключения
+        base_delay = 5  # Базовая задержка в секундах
+        
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Проверяем соединение с Telegram API
+                me = await self.bot.get_me()
+                logger.info(f"{ACCENT_COLOR}Успешное подключение к Telegram API как @{me.username}")
+                
+                # Обновляем команды и настройки бота
+                await self._update_bot_commands()
+                await self._set_short_description()
+                await self._set_description()
+
+                await call_bot_event("ON_TELEGRAM_BOT_INIT", [self])
+
+                try:
+                    await self._ensure_startup_status_and_playerok_prompt()
+                except Exception as e:
+                    logger.debug(f"Не удалось отправить startup-статус/activation prompt: {e}")
+                 
+                logger.info(f"{ACCENT_COLOR}Telegram бот {Fore.LIGHTCYAN_EX}@{me.username} {ACCENT_COLOR}запущен и активен")
+                
+                # Запускаем систему объявлений
+                try:
+                    from announcements import start_announcements_loop
+                    await start_announcements_loop(self)
+                except Exception as e:
+                    logger.warning(f"Не удалось запустить систему объявлений: {e}")
+                
+                # Запускаем бота с обработкой ошибок
+                try:
+                    await self.dp.start_polling(self.bot, skip_updates=True, handle_signals=False)
+                    break  # Выходим из цикла при успешном запуске
+                except (TelegramNetworkError, TelegramAPIError) as e:
+                    if attempt == max_retries:
+                        raise  # Пробрасываем исключение, если попытки исчерпаны
+                    logger.warning(f"Ошибка сети/API при запуске бота: {e}")
+                    logger.warning(TG_PROXY_HELP_TEXT)
+                
+            except Exception as e:
+                if attempt == max_retries:
+                    logger.error(f"{Fore.RED}Не удалось подключиться к Telegram API после {max_retries} попыток. Завершение работы.")
+                    logger.error(TG_PROXY_HELP_TEXT)
+                    raise  # Пробрасываем исключение, если попытки исчерпаны
+                
+                # Вычисляем экспоненциальную задержку с джиттером
+                delay = min(base_delay * (2 ** (attempt - 1)) + random.uniform(0, 1), 60)
+                logger.warning(
+                    f"{Fore.YELLOW}Ошибка подключения к Telegram API (попытка {attempt}/{max_retries}): {e}"
+                    f"{Fore.WHITE} Повторная попытка через {delay:.1f} секунд..."
+                )
+                logger.warning(TG_PROXY_HELP_TEXT)
+                await asyncio.sleep(delay)
+                
+                # Обновляем токен бота перед следующей попыткой
+                if attempt % 3 == 0:  # Обновляем токен каждые 3 попытки
+                    try:
+                        config = sett.get("config")
+                        self.bot = self._build_bot_from_config(config)
+                        logger.info("Обновлен токен бота")
+                    except Exception as token_error:
+                        logger.error(f"Ошибка при обновлении токена бота: {token_error}")
+        
+
+    async def call_seller(self, calling_name: str, chat_id: int | str):
+        """
+        Пишет админу в Telegram с просьбой о помощи от заказчика.
+                
+        :param calling_name: Никнейм покупателя.
+        :type calling_name: `str`
+
+        :param chat_id: ID чата с заказчиком.
+        :type chat_id: `int` or `str`
+        """
+        config = sett.get("config")
+        for user_id in config["telegram"]["bot"]["signed_users"]:
+            await self.bot.send_message(
+                chat_id=user_id, 
+                text=templ.call_seller_text(calling_name, f"https://playerok.com/chats/{chat_id}"),
+                reply_markup=templ.destroy_kb(),
+                parse_mode="HTML"
+            )
+        
+    async def send_startup_notification(self):
+        """
+        Отправляет уведомление администратору о запуске бота.
+        """
+        try:
+            config = sett.get("config")
+            me = await self.bot.get_me()
+            
+            # Получаем информацию о системе
+            import platform
+            import socket
+            import datetime
+            
+            hostname = socket.gethostname()
+            ip_address = socket.gethostbyname(hostname)
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            message = (
+                f"<b>{BOT_NAME} v{VERSION} активен!</b>\n\n"
+                f"• <b>Бот:</b> @{me.username}\n"
+                f"• <b>Версия:</b> {VERSION}\n"
+                f"• <b>Связь:</b> {DEVELOPER}\n"
+                f"• <b>Время запуска:</b> {current_time}\n"
+                f"• <b>Сервер:</b> {hostname}\n"
+                f"• <b>ОС:</b> {platform.system()} {platform.release()}\n\n"
+                f"✅ Готов к работе!"
+            )
+            
+            # Отправляем уведомление всем администраторам
+            for admin_id in config["telegram"]["bot"].get("signed_users", []):
+                try:
+                    await self.bot.send_message(
+                        chat_id=admin_id,
+                        text=message,
+                        parse_mode="HTML"
+                    )
+                except Exception as e:
+                    logger.error(f"Не удалось отправить уведомление администратору {admin_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка при отправке уведомления о запуске: {e}")
+
+    async def log_event(self, text: str, kb: InlineKeyboardMarkup | None = None):
+        """
+        Логирует событие в чат TG бота.
+                
+        :param text: Текст лога.
+        :type text: `str`
+                
+        :param kb: Клавиатура с кнопками.
+        :type kb: `aiogram.types.InlineKeyboardMarkup` or `None`
+        """
+        try:
+            config = sett.get("config")
+            chat_id = config["playerok"]["tg_logging"]["chat_id"]
+            if not chat_id:
+                signed_users = config["telegram"]["bot"]["signed_users"]
+                logger.info(f"Отправка уведомления {len(signed_users)} пользователям: {signed_users}")
+                for user_id in signed_users:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=user_id, 
+                            text=text, 
+                            reply_markup=kb, 
+                            parse_mode="HTML"
+                        )
+                        logger.info(f"Уведомление успешно отправлено пользователю {user_id}")
+                    except TelegramForbiddenError:
+                        logger.warning(f"Не удалось отправить уведомление пользователю {user_id}: бот заблокирован")
+                    except Exception as e:
+                        logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+            else:
+                logger.info(f"Отправка уведомления в чат {chat_id}")
+                try:
+                    await self.bot.send_message(
+                        chat_id=chat_id, 
+                        text=f'{text}\n<span class="tg-spoiler">Переключите чат логов на чат с ботом, чтобы отображалась меню с действиями</span>', 
+                        reply_markup=None, 
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"Уведомление успешно отправлено в чат {chat_id}")
+                except TelegramForbiddenError:
+                    logger.warning(f"Не удалось отправить уведомление в чат {chat_id}: бот заблокирован")
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления в чат {chat_id}: {e}")
+        except Exception as e:
+            logger.error(f"Критическая ошибка в log_event: {e}")
